@@ -16,6 +16,7 @@ Adds, for each axis <axis> in {mood, genre, energy, aesthetic}:
 
 import argparse
 import sys
+import time
 from pathlib import Path
 import numpy as np
 
@@ -245,6 +246,95 @@ def calibrate_scores(sims):
     return z_scores
 
 
+def compute_embeddings_checkpointed(
+    texts,
+    model,
+    checkpoint_dir,
+    chunk_size,
+    model_name,
+    encode_batch_size,
+    push_every,
+    do_push,
+    repo_dir,
+):
+    """
+    Encode `texts` in row-order chunks, checkpointing each chunk to disk as
+    it completes and (optionally) pushing checkpoints to git periodically.
+
+    Safe to interrupt and re-run: any chunk already valid on disk is
+    skipped, so a crash only ever costs the partially-encoded chunk that
+    was in flight, not the whole run.
+    """
+    from checkpoint_utils import EmbeddingCheckpoint, git_checkpoint_push, chunk_bounds
+
+    n_rows = len(texts)
+    ckpt = EmbeddingCheckpoint(checkpoint_dir, n_rows, chunk_size, model_name)
+    bounds = list(chunk_bounds(n_rows, chunk_size))
+    total_chunks = len(bounds)
+
+    already_done, _ = ckpt.progress(total_chunks)
+    if already_done:
+        print(
+            f"      Resuming from checkpoint: {already_done}/{total_chunks} "
+            f"chunks already done ({min(already_done * chunk_size, n_rows)}/{n_rows} rows)."
+        )
+
+    since_last_push = 0
+    t0 = time.time()
+
+    try:
+        for chunk_idx, start, end in bounds:
+            expected_rows = end - start
+
+            if ckpt.is_done(chunk_idx, expected_rows):
+                continue
+
+            chunk_embs = model.encode(
+                texts[start:end],
+                batch_size=encode_batch_size,
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+                show_progress_bar=False,
+            )
+            ckpt.save_chunk(chunk_idx, chunk_embs)
+            since_last_push += 1
+
+            elapsed = time.time() - t0
+            print(
+                f"      chunk {chunk_idx + 1}/{total_chunks} "
+                f"(rows {start}-{end}) encoded & checkpointed. "
+                f"[{end}/{n_rows} rows, {elapsed:.0f}s elapsed]"
+            )
+
+            is_last_chunk = chunk_idx == total_chunks - 1
+            if do_push and (since_last_push >= push_every or is_last_chunk):
+                git_checkpoint_push(
+                    repo_dir,
+                    [str(ckpt.dir)],
+                    message=(
+                        f"checkpoint: embeddings through chunk {chunk_idx} "
+                        f"(rows 0-{end}/{n_rows})"
+                    ),
+                )
+                since_last_push = 0
+    except (Exception, KeyboardInterrupt):
+        print(
+            "\n      Run interrupted or failed mid-encode. Everything checkpointed "
+            "so far is safe on disk. Attempting a final push before raising ..."
+        )
+        if do_push:
+            from checkpoint_utils import git_checkpoint_push as _push
+
+            _push(
+                repo_dir,
+                [str(ckpt.dir)],
+                message="checkpoint: partial progress (run interrupted)",
+            )
+        raise
+
+    return ckpt.load_all(total_chunks)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Label Arabic verse batches on mood/genre/energy/aesthetic axes via embedding Z-Scores."
@@ -259,6 +349,35 @@ def main():
         type=float,
         default=None,
         help="Override gap threshold",
+    )
+    ap.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default="checkpoints",
+        help="Directory for resumable embedding checkpoints (default: ./checkpoints)",
+    )
+    ap.add_argument(
+        "--chunk-size",
+        type=int,
+        default=500,
+        help="Rows per checkpoint chunk during embedding (default: 500)",
+    )
+    ap.add_argument(
+        "--push-every",
+        type=int,
+        default=4,
+        help="Git-push checkpoints every N completed chunks (default: 4)",
+    )
+    ap.add_argument(
+        "--no-git-push",
+        action="store_true",
+        help="Save checkpoints locally but never git commit/push them",
+    )
+    ap.add_argument(
+        "--repo-dir",
+        type=str,
+        default=".",
+        help="Git repo root to commit/push from (default: current directory)",
     )
     args = ap.parse_args()
 
@@ -295,13 +414,21 @@ def main():
 
     model = SentenceTransformer(MODEL_NAME, device=device)
 
-    print("[4/5] Encoding batch texts ...")
-    batch_embs = model.encode(
-        df["_batch_text"].tolist(),
-        batch_size=args.batch_size,
-        normalize_embeddings=True,
-        convert_to_numpy=True,
-        show_progress_bar=True,
+    print(
+        f"[4/5] Encoding batch texts (chunk-size={args.chunk_size}, "
+        f"checkpoint-dir={args.checkpoint_dir}, "
+        f"git-push={'off' if args.no_git_push else f'every {args.push_every} chunks'}) ..."
+    )
+    batch_embs = compute_embeddings_checkpointed(
+        texts=df["_batch_text"].tolist(),
+        model=model,
+        checkpoint_dir=args.checkpoint_dir,
+        chunk_size=args.chunk_size,
+        model_name=MODEL_NAME,
+        encode_batch_size=args.batch_size,
+        push_every=args.push_every,
+        do_push=not args.no_git_push,
+        repo_dir=args.repo_dir,
     )
 
     print("[5/5] Scoring + calibrating tags per axis ...")
@@ -367,6 +494,15 @@ def main():
 
     df.to_pickle(out_path)
     print(f"Done. Saved -> {out_path}")
+
+    if not args.no_git_push:
+        from checkpoint_utils import git_checkpoint_push
+
+        git_checkpoint_push(
+            args.repo_dir,
+            [str(out_path)],
+            message=f"Final labeled output: {out_path.name} ({len(df)} rows)",
+        )
 
     n_flagged = sum(1 for f in flagged_col if f)
     print(
