@@ -1,0 +1,6 @@
+{
+  "n_rows": 23979,
+  "chunk_size": 500,
+  "model_name": "BAAI/bge-m3",
+  "embedding_dim": 1024
+}
